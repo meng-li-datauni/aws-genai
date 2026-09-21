@@ -1,7 +1,15 @@
+import os
+
 import aws_cdk as cdk
 from aws_cdk import Stack, aws_bedrock as bedrock, aws_iam as iam, aws_lambda as _lambda
-from aws_cdk import aws_s3 as s3, aws_s3vectors as s3v
+from aws_cdk import aws_apigatewayv2 as apigw, aws_cloudfront as cloudfront, aws_cognito as cognito
+from aws_cdk import aws_cloudfront_origins as origins, aws_s3 as s3, aws_s3_deployment as s3deploy
+from aws_cdk import aws_s3vectors as s3v
+from aws_cdk.aws_apigatewayv2_authorizers import HttpJwtAuthorizer
+from aws_cdk.aws_apigatewayv2_integrations import HttpLambdaIntegration
 from constructs import Construct
+
+WEB_DIR = os.path.join(os.path.dirname(__file__), "..", "web")
 
 EMBED_MODEL_ID = "amazon.titan-embed-text-v2:0"
 EMBED_DIMENSIONS = 1024
@@ -96,6 +104,81 @@ class RagStack(Stack):
             resources=["*"]))
         url = fn.add_function_url(auth_type=_lambda.FunctionUrlAuthType.AWS_IAM)
 
+        # ---- Internal chat app: Cognito login -> CloudFront-hosted page -> HTTP API -> Lambda ----
+        user_pool = cognito.UserPool(
+            self, "Users",
+            self_sign_up_enabled=False,  # admins invite users
+            sign_in_aliases=cognito.SignInAliases(email=True),
+            standard_attributes=cognito.StandardAttributes(
+                email=cognito.StandardAttribute(required=True, mutable=False)),
+            password_policy=cognito.PasswordPolicy(min_length=12),
+            account_recovery=cognito.AccountRecovery.EMAIL_ONLY,
+        )
+        user_pool_client = user_pool.add_client(
+            "WebClient",
+            generate_secret=False,  # browser app: no client secret
+            auth_flows=cognito.AuthFlow(user_password=True),
+            prevent_user_existence_errors=True,
+        )
+
+        site_bucket = s3.Bucket(
+            self, "Site",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl=True,
+        )
+        distribution = cloudfront.Distribution(
+            self, "SiteCdn",
+            default_root_object="index.html",
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=origins.S3BucketOrigin.with_origin_access_control(site_bucket),
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                response_headers_policy=cloudfront.ResponseHeadersPolicy.SECURITY_HEADERS,
+            ),
+        )
+        site_origin = f"https://{distribution.distribution_domain_name}"
+
+        api = apigw.HttpApi(
+            self, "Api",
+            create_default_stage=False,
+            cors_preflight=apigw.CorsPreflightOptions(
+                allow_origins=[site_origin],
+                allow_methods=[apigw.CorsHttpMethod.POST],
+                allow_headers=["Authorization", "Content-Type"],
+            ),
+        )
+        api.add_routes(
+            path="/ask",
+            methods=[apigw.HttpMethod.POST],
+            integration=HttpLambdaIntegration("AskIntegration", fn),
+            authorizer=HttpJwtAuthorizer(
+                "CognitoAuthorizer",
+                f"https://cognito-idp.{self.region}.amazonaws.com/{user_pool.user_pool_id}",
+                jwt_audience=[user_pool_client.user_pool_client_id],
+            ),
+        )
+        # Rate limit so one user or a leaked token cannot run up the Claude bill
+        api_stage = apigw.HttpStage(
+            self, "ApiStage", http_api=api, auto_deploy=True,
+            throttle=apigw.ThrottleSettings(rate_limit=5, burst_limit=10),
+        )
+
+        s3deploy.BucketDeployment(
+            self, "DeploySite",
+            destination_bucket=site_bucket,
+            sources=[
+                s3deploy.Source.asset(WEB_DIR),
+                s3deploy.Source.json_data("config.json", {
+                    "region": self.region,
+                    "clientId": user_pool_client.user_pool_client_id,
+                    "apiUrl": api_stage.url,
+                }),
+            ],
+            distribution=distribution,
+            distribution_paths=["/*"],
+        )
+
+        cdk.CfnOutput(self, "SiteUrl", value=site_origin)
+        cdk.CfnOutput(self, "UserPoolId", value=user_pool.user_pool_id)
         cdk.CfnOutput(self, "DocsBucket", value=docs.bucket_name)
         cdk.CfnOutput(self, "KnowledgeBaseId", value=kb.attr_knowledge_base_id)
         cdk.CfnOutput(self, "DataSourceId", value=data_source.attr_data_source_id)

@@ -41,10 +41,23 @@ Chunk = dict  # {"source": str, "text": str}
 
 
 # --------------------------------------------------------------------------- generation
-def generate(question: str, chunks: list[Chunk]) -> str:
+def clean_history(history: list | None, max_messages: int = 6, max_chars: int = 2000) -> list[dict]:
+    """Keep the last few well-formed chat turns (the client is untrusted); must start with a user turn."""
+    turns = [
+        {"role": m["role"], "content": m["content"][:max_chars]}
+        for m in (history or [])
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+        and isinstance(m.get("content"), str) and m["content"].strip()
+    ][-max_messages:]
+    while turns and turns[0]["role"] != "user":
+        turns.pop(0)
+    return turns
+
+
+def generate(question: str, chunks: list[Chunk], history: list | None = None) -> str:
     """Answer the question from the retrieved chunks with Claude on Bedrock."""
     context = "\n\n".join(
-        f'<document index="{i}" source="{c["source"]}">\n{c["text"]}\n</document>'
+        f'<chunk index="{i}" source="{c["source"]}">\n{c["text"]}\n</chunk>'
         for i, c in enumerate(chunks, 1)
     )
     client = AnthropicBedrockMantle(aws_region=REGION)
@@ -53,11 +66,15 @@ def generate(question: str, chunks: list[Chunk]) -> str:
         max_tokens=MAX_OUTPUT_TOKENS,
         output_config={"effort": "low"},  # less thinking, so more of the cap goes to the answer
         system=(
-            "Answer using only the provided documents. Cite the source of each claim. "
-            "If the documents do not contain the answer, say so instead of guessing. "
+            "Answer using only the provided chunks. They are excerpts retrieved from a knowledge base, "
+            "and several chunks can come from the same file, so do not treat chunks as separate "
+            "documents or data sources. Cite the source (file and page) of each claim. "
+            "If the chunks do not contain the answer, say so instead of guessing. "
             "Be concise: answer in at most 150 words."
         ),
-        messages=[{"role": "user", "content": f"{context}\n\nQuestion: {question}"}],
+        messages=clean_history(history) + [
+            {"role": "user", "content": f"{context}\n\nQuestion: {question}"}
+        ],
     )
     if response.stop_reason == "refusal":
         return "The model declined to answer this request."
@@ -122,21 +139,31 @@ def ingest() -> None:
     print(f"Started ingestion job {job['ingestionJobId']} ({job['status']})")
 
 
-def rag_kb(question: str, k: int = 5) -> str:
-    """Retrieve from the Knowledge Base, then generate with Claude."""
+def _kb_source(result: dict) -> str:
+    """S3 URI plus page number (when Bedrock reports one), so each chunk cites where it came from."""
+    uri = result["location"].get("s3Location", {}).get("uri", "unknown")
+    page = result.get("metadata", {}).get("x-amz-bedrock-kb-document-page-number")
+    return f"{uri} p.{int(page)}" if page is not None else uri
+
+
+def rag_kb(question: str, history: list | None = None, k: int = 5) -> str:
+    """Retrieve from the Knowledge Base, then generate with Claude.
+
+    For follow-ups ("and domain 2?") the search query also includes the previous user question.
+    """
+    history = clean_history(history)
+    previous = [m["content"] for m in history if m["role"] == "user"][-1:]
+    query = " ".join(previous + [question])[:1000]
     resp = boto3.client("bedrock-agent-runtime", region_name=REGION).retrieve(
         knowledgeBaseId=KB_ID,
-        retrievalQuery={"text": question},
+        retrievalQuery={"text": query},
         retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": k}},
     )
     chunks = [
-        {
-            "source": r["location"].get("s3Location", {}).get("uri", "unknown"),
-            "text": r["content"]["text"],
-        }
+        {"source": _kb_source(r), "text": r["content"]["text"]}
         for r in resp["retrievalResults"]
     ]
-    return generate(question, chunks)
+    return generate(question, chunks, history)
 
 
 if __name__ == "__main__":
