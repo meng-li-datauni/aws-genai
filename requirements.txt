@@ -1,0 +1,6 @@
+boto3
+anthropic[bedrock]
+pypdf
+numpy
+aws-cdk-lib
+constructs

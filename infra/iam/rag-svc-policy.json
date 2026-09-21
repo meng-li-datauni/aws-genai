@@ -1,0 +1,50 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CdkDeployViaBootstrapRoles",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::${ACCOUNT_ID}:role/cdk-hnb659fds-*"
+    },
+    {
+      "Sid": "CdkReadStacksAndBootstrapVersion",
+      "Effect": "Allow",
+      "Action": ["cloudformation:DescribeStacks", "cloudformation:GetTemplate"],
+      "Resource": [
+        "arn:aws:cloudformation:${REGION}:${ACCOUNT_ID}:stack/CDKToolkit/*",
+        "arn:aws:cloudformation:${REGION}:${ACCOUNT_ID}:stack/BedrockRagStack/*"
+      ]
+    },
+    {
+      "Sid": "CdkBootstrapVersionParam",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter/cdk-bootstrap/hnb659fds/version"
+    },
+    {
+      "Sid": "UploadDocs",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::bedrockragstack-docs*", "arn:aws:s3:::bedrockragstack-docs*/*"]
+    },
+    {
+      "Sid": "KnowledgeBaseIngestAndQuery",
+      "Effect": "Allow",
+      "Action": ["bedrock:StartIngestionJob", "bedrock:GetIngestionJob", "bedrock:Retrieve"],
+      "Resource": "arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:knowledge-base/*"
+    },
+    {
+      "Sid": "InvokeModels",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CallQueryFunctionUrl",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunctionUrl",
+      "Resource": "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:BedrockRagStack-QueryFn*"
+    }
+  ]
+}
